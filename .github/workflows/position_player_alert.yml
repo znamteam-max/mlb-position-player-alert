@@ -1,0 +1,51 @@
+name: MLB Position Player Pitching Alert
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore alert state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache
+          key: position-player-alert-${{ github.run_id }}
+          restore-keys: |
+            position-player-alert-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALERT_ONLY_LATE_INNINGS: 'true'
+          LATE_INNING_THRESHOLD: '7'
+          INCLUDE_BLOWOUT_ONLY: 'false'
+          SCORE_DIFF_THRESHOLD: '6'
+          STATE_FILE: .cache/position_player_alert_state.json
+        run: |
+          mkdir -p .cache
+          python bot.py
+
+      - name: Save alert state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache
+          key: position-player-alert-${{ github.run_id }}
