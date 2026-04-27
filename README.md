@@ -16,6 +16,7 @@ It uses MLB's public live game feed and schedule endpoints to:
 
 - `bot.py` — polling logic and Telegram alerts
 - `app.py` — small Flask entrypoint for Vercel deployments
+- `command_extensions.py` — extra Telegram commands for historical blowout/watch checks
 - `requirements.txt` — Python dependency list
 - `.env.example` — local environment variables
 - `.github/workflows/position_player_alert.yml` — GitHub Actions scheduler
@@ -79,9 +80,10 @@ Supported commands:
 
 - `/live` — currently live MLB games with teams, score, and inning. If there are no live games, the bot replies `Live матчей пока нет`.
 - `/recent` — last 5 detected position-player pitching appearances, including innings pitched, how the outing ended, hits, runs, and earned runs allowed.
+- `/blowouts` — last 5 completed blowout games where the score differential crossed the watch threshold and a position-player pitching appearance became more likely. Aliases: `/watch`, `/разгромы`, `/вероятность`.
 - `/help` — command list.
 
-`/recent` scans recently completed MLB games and caches the answer briefly. Tune these values if needed:
+`/recent` and `/blowouts` scan recently completed MLB games and cache the answer briefly. Tune these values if needed:
 
 - `RECENT_CASE_LOOKBACK_DAYS`
 - `RECENT_CASE_MIN_SCORE_DIFF`
