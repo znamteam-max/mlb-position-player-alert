@@ -44,12 +44,14 @@ The repository includes `app.py` so Vercel can detect a Flask app entrypoint. Af
 
 - `/` returns a healthcheck response
 - `/api/cron` runs the alert bot
+- `/api/telegram` handles Telegram commands
 
 Add these environment variables in Vercel:
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `CRON_SECRET` — a random string of at least 16 characters
+- `TELEGRAM_WEBHOOK_SECRET` — a separate random string for Telegram webhook validation
 
 The `/api/cron` endpoint requires this header:
 
@@ -65,6 +67,26 @@ curl -H "Authorization: Bearer $CRON_SECRET" https://your-project.vercel.app/api
 
 Vercel Hobby plans only allow built-in cron jobs to run once per day. This bot is designed for frequent polling, so keep GitHub Actions enabled for the default 5-minute schedule unless you use Vercel Pro or an external scheduler that can call `/api/cron` with the authorization header.
 
+Telegram command setup:
+
+```bash
+curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
+  -d "url=https://your-project.vercel.app/api/telegram" \
+  -d "secret_token=$TELEGRAM_WEBHOOK_SECRET"
+```
+
+Supported commands:
+
+- `/live` — currently live MLB games with teams, score, and inning. If there are no live games, the bot replies `Live матчей пока нет`.
+- `/recent` — last 5 detected position-player pitching appearances, including innings pitched, how the outing ended, hits, runs, and earned runs allowed.
+- `/help` — command list.
+
+`/recent` scans recently completed MLB games and caches the answer briefly. Tune these values if needed:
+
+- `RECENT_CASE_LOOKBACK_DAYS`
+- `RECENT_CASE_MIN_SCORE_DIFF`
+- `COMMAND_CACHE_TTL_SECONDS`
+
 ## Default behavior
 
 The workflow runs every 5 minutes and is currently configured to:
@@ -79,6 +101,9 @@ You can change these values in the workflow env block:
 - `SCORE_DIFF_THRESHOLD`
 - `ENABLE_BLOWOUT_WARNING`
 - `INCLUDE_BLOWOUT_ONLY`
+- `RECENT_CASE_LOOKBACK_DAYS`
+- `RECENT_CASE_MIN_SCORE_DIFF`
+- `COMMAND_CACHE_TTL_SECONDS`
 
 The state file stores separate dedupe keys for the blowout warning and the confirmed position-player pitching alert. If both conditions are first detected during the same run, the warning is sent first and the confirmation is sent immediately after it.
 

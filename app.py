@@ -5,7 +5,7 @@ from flask import Flask, jsonify, request
 
 os.environ.setdefault("STATE_FILE", "/tmp/position_player_alert_state.json")
 
-from bot import BotError, run
+from bot import BotError, handle_telegram_update, run
 
 app = Flask(__name__)
 
@@ -26,6 +26,18 @@ def authorize_cron():
     return None
 
 
+def authorize_telegram_webhook():
+    expected = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+    if not expected:
+        return None
+
+    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if secret_header != expected:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    return None
+
+
 @app.get("/")
 def healthcheck():
     return jsonify(
@@ -33,6 +45,7 @@ def healthcheck():
             "ok": True,
             "service": "mlb-position-player-alert",
             "cron_path": "/api/cron",
+            "telegram_webhook_path": "/api/telegram",
             "timestamp": utc_now(),
         }
     )
@@ -63,3 +76,31 @@ def cron():
         )
 
     return jsonify({"ok": True, "alerts_sent": sent_count, "timestamp": utc_now()})
+
+
+@app.post("/api/telegram")
+def telegram_webhook():
+    unauthorized_response = authorize_telegram_webhook()
+    if unauthorized_response is not None:
+        return unauthorized_response
+
+    update = request.get_json(silent=True) or {}
+    try:
+        result = handle_telegram_update(update)
+    except BotError as exc:
+        return jsonify({"ok": False, "error": str(exc), "timestamp": utc_now()}), 500
+    except Exception as exc:
+        app.logger.exception("Telegram command handling failed")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Telegram command handling failed",
+                    "error_type": type(exc).__name__,
+                    "timestamp": utc_now(),
+                }
+            ),
+            500,
+        )
+
+    return jsonify({"ok": True, "result": result, "timestamp": utc_now()})
