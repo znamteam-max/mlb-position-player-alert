@@ -1,12 +1,16 @@
 # MLB position-player pitching alert bot
 
-This bot checks live MLB games and sends a Telegram alert when the current pitcher is **not** a primary-position pitcher.
+This bot checks live MLB games and sends Telegram alerts in two steps:
+
+1. A blowout warning when the score differential reaches the configured threshold and a position-player pitching appearance becomes more likely.
+2. A follow-up alert when the current pitcher is **not** a primary-position pitcher.
 
 It uses MLB's public live game feed and schedule endpoints to:
 - find live MLB games
+- detect blowout score situations
 - identify the current defensive pitcher
 - compare that player's **primary position** against `P`
-- send a Telegram message when a position player is on the mound
+- send Telegram messages in the warning-then-confirmation order
 
 ## Files
 
@@ -65,14 +69,18 @@ Vercel Hobby plans only allow built-in cron jobs to run once per day. This bot i
 
 The workflow runs every 5 minutes and is currently configured to:
 - alert only from the 7th inning on
-- not require a blowout score
+- send a blowout warning once the score differential reaches 6 runs
+- require a blowout score before sending the position-player pitching confirmation
 
 You can change these values in the workflow env block:
 
 - `ALERT_ONLY_LATE_INNINGS`
 - `LATE_INNING_THRESHOLD`
-- `INCLUDE_BLOWOUT_ONLY`
 - `SCORE_DIFF_THRESHOLD`
+- `ENABLE_BLOWOUT_WARNING`
+- `INCLUDE_BLOWOUT_ONLY`
+
+The state file stores separate dedupe keys for the blowout warning and the confirmed position-player pitching alert. If both conditions are first detected during the same run, the warning is sent first and the confirmation is sent immediately after it.
 
 ## Local run
 
