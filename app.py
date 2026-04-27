@@ -5,7 +5,8 @@ from flask import Flask, jsonify, request
 
 os.environ.setdefault("STATE_FILE", "/tmp/position_player_alert_state.json")
 
-from bot import BotError, handle_telegram_update, run
+from bot import BotError, run
+from command_extensions import handle_telegram_update
 
 app = Flask(__name__)
 
