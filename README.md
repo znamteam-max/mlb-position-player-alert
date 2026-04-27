@@ -11,6 +11,7 @@ It uses MLB's public live game feed and schedule endpoints to:
 ## Files
 
 - `bot.py` — polling logic and Telegram alerts
+- `app.py` — small Flask entrypoint for Vercel deployments
 - `requirements.txt` — Python dependency list
 - `.env.example` — local environment variables
 - `.github/workflows/position_player_alert.yml` — GitHub Actions scheduler
@@ -32,6 +33,33 @@ Add these repository secrets in GitHub:
 - create `TELEGRAM_CHAT_ID`
 
 Then enable GitHub Actions for the repository.
+
+## Vercel setup
+
+The repository includes `app.py` so Vercel can detect a Flask app entrypoint. After deployment:
+
+- `/` returns a healthcheck response
+- `/api/cron` runs the alert bot
+
+Add these environment variables in Vercel:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `CRON_SECRET` — a random string of at least 16 characters
+
+The `/api/cron` endpoint requires this header:
+
+```bash
+Authorization: Bearer $CRON_SECRET
+```
+
+Manual test example:
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" https://your-project.vercel.app/api/cron
+```
+
+Vercel Hobby plans only allow built-in cron jobs to run once per day. This bot is designed for frequent polling, so keep GitHub Actions enabled for the default 5-minute schedule unless you use Vercel Pro or an external scheduler that can call `/api/cron` with the authorization header.
 
 ## Default behavior
 
@@ -59,6 +87,7 @@ python bot.py
 
 - GitHub Actions cron is good for lightweight polling, but it is not truly instant.
 - The state file is cached between workflow runs to avoid duplicate alerts for the same game and pitcher.
+- Vercel's filesystem is ephemeral, so `/api/cron` uses `/tmp` for temporary state and should not be relied on as the primary duplicate-alert store.
 - MLB live-feed field names can shift over time. If the bot stops detecting the current pitcher correctly, the first thing to check is the `liveData.linescore.defense.pitcher` path and the player metadata path in `gameData.players`.
 
 ## Good Codex follow-up task
