@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -9,6 +10,7 @@ import requests
 SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 LIVE_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+PLAYER_STATS_URL = "https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
@@ -26,9 +28,12 @@ LATE_INNING_THRESHOLD = int(os.getenv("LATE_INNING_THRESHOLD", "7"))
 INCLUDE_BLOWOUT_ONLY = env_bool("INCLUDE_BLOWOUT_ONLY", False)
 SCORE_DIFF_THRESHOLD = int(os.getenv("SCORE_DIFF_THRESHOLD", "6"))
 ENABLE_BLOWOUT_WARNING = env_bool("ENABLE_BLOWOUT_WARNING", True)
+CONFIRMED_ALERT_REPEAT_COUNT = int(os.getenv("CONFIRMED_ALERT_REPEAT_COUNT", "3"))
+CONFIRMED_ALERT_REPEAT_DELAY_SECONDS = float(os.getenv("CONFIRMED_ALERT_REPEAT_DELAY_SECONDS", "3"))
 RECENT_CASE_LOOKBACK_DAYS = int(os.getenv("RECENT_CASE_LOOKBACK_DAYS", "90"))
 RECENT_CASE_MIN_SCORE_DIFF = int(os.getenv("RECENT_CASE_MIN_SCORE_DIFF", "6"))
 COMMAND_CACHE_TTL_SECONDS = int(os.getenv("COMMAND_CACHE_TTL_SECONDS", "1800"))
+SEASON_CASE_CACHE_TTL_SECONDS = int(os.getenv("SEASON_CASE_CACHE_TTL_SECONDS", "21600"))
 STATE_FILE = Path(os.getenv("STATE_FILE", ".position_player_alert_state.json"))
 REQUEST_TIMEOUT = 20
 USER_AGENT = "mlb-position-player-alert-bot/1.0"
@@ -139,8 +144,10 @@ def as_int(value: Any) -> Optional[int]:
 def schedule_team_name(game: Dict[str, Any], side: str) -> str:
     return safe_get(game, "teams", side, "team", "name") or side.title()
 
+
 def schedule_team_score(game: Dict[str, Any], side: str) -> Optional[int]:
     return as_int(safe_get(game, "teams", side, "score"))
+
 
 def game_score_diff(game: Dict[str, Any]) -> Optional[int]:
     away_score = schedule_team_score(game, "away")
@@ -167,10 +174,16 @@ def format_inning(inning_half: Any, current_inning: Any) -> str:
         return f"низ {current_inning}-го"
     return f"{current_inning}-й иннинг"
 
+
 def is_late_enough(current_inning: Any) -> bool:
     if ALERT_ONLY_LATE_INNINGS and isinstance(current_inning, int) and current_inning < LATE_INNING_THRESHOLD:
         return False
     return True
+
+
+def current_mlb_season_start(today: Optional[date] = None) -> date:
+    current_day = today or datetime.now(timezone.utc).date()
+    return date(current_day.year, 1, 1)
 
 
 def build_game_context(feed: Dict[str, Any]) -> Dict[str, Any]:
@@ -181,6 +194,8 @@ def build_game_context(feed: Dict[str, Any]) -> Dict[str, Any]:
     is_top = bool(linescore.get("isTopInning"))
     home_team = safe_get(game_data, "teams", "home", "name") or "Home"
     away_team = safe_get(game_data, "teams", "away", "name") or "Away"
+    home_team_id = safe_get(game_data, "teams", "home", "id")
+    away_team_id = safe_get(game_data, "teams", "away", "id")
     home_runs = safe_get(linescore, "teams", "home", "runs")
     away_runs = safe_get(linescore, "teams", "away", "runs")
 
@@ -206,6 +221,8 @@ def build_game_context(feed: Dict[str, Any]) -> Dict[str, Any]:
         "inning_half": "Top" if is_top else "Bottom",
         "home_team": home_team,
         "away_team": away_team,
+        "home_team_id": home_team_id,
+        "away_team_id": away_team_id,
         "home_runs": home_runs,
         "away_runs": away_runs,
         "score_diff": score_diff,
@@ -213,13 +230,212 @@ def build_game_context(feed: Dict[str, Any]) -> Dict[str, Any]:
         "leading_team": leading_team,
         "trailing_team": trailing_team,
         "defensive_team": home_team if is_top else away_team,
+        "defensive_team_id": home_team_id if is_top else away_team_id,
         "batting_team": away_team if is_top else home_team,
         "detailed_state": safe_get(game_data, "status", "detailedState") or "Live",
         "game_pk": game_data.get("game", {}).get("pk") or feed.get("gamePk"),
     }
 
 
-def build_blowout_warning(feed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def game_team_id_strings(game: Dict[str, Any]) -> set:
+    ids = {
+        safe_get(game, "teams", "away", "team", "id"),
+        safe_get(game, "teams", "home", "team", "id"),
+    }
+    return {str(team_id) for team_id in ids if team_id is not None}
+
+
+def game_team_names(game: Dict[str, Any]) -> set:
+    return {schedule_team_name(game, "away"), schedule_team_name(game, "home")}
+
+
+def game_team_contexts(context: Dict[str, Any]) -> List[Dict[str, Any]]:
+    teams = [
+        {"id": context["away_team_id"], "name": context["away_team"]},
+        {"id": context["home_team_id"], "name": context["home_team"]},
+    ]
+    ordered: List[Dict[str, Any]] = []
+    for team_name in (context.get("leading_team"), context.get("trailing_team")):
+        for team in teams:
+            if team["name"] == team_name and team not in ordered:
+                ordered.append(team)
+    for team in teams:
+        if team not in ordered:
+            ordered.append(team)
+    return ordered
+
+
+def case_matches_team(case: Dict[str, Any], team: Dict[str, Any]) -> bool:
+    team_id = team.get("id")
+    if team_id is not None and str(case.get("team_id")) == str(team_id):
+        return True
+    return case.get("team_name") == team.get("name")
+
+
+def case_matches_any_team(case: Dict[str, Any], teams: List[Dict[str, Any]]) -> bool:
+    return any(case_matches_team(case, team) for team in teams)
+
+
+def season_case_cache_key(team_contexts: List[Dict[str, Any]]) -> str:
+    identities = []
+    for team in team_contexts:
+        identity = team.get("id") if team.get("id") is not None else team.get("name")
+        identities.append(str(identity))
+    return ",".join(sorted(identities))
+
+
+def find_current_season_position_player_pitching_cases_for_teams(
+    team_contexts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    end_date = datetime.now(timezone.utc).date()
+    start_date = current_mlb_season_start(end_date)
+    target_team_ids = {str(team["id"]) for team in team_contexts if team.get("id") is not None}
+    target_team_names = {str(team["name"]) for team in team_contexts if team.get("name")}
+    games = get_schedule_games(start_date, end_date)
+    games.sort(key=lambda item: item.get("gameDate", ""), reverse=True)
+
+    cases: List[Dict[str, Any]] = []
+    for game in games:
+        status = game.get("status", {})
+        if status.get("abstractGameState") != "Final":
+            continue
+
+        if target_team_ids and not (game_team_id_strings(game) & target_team_ids):
+            continue
+        if not target_team_ids and not (game_team_names(game) & target_team_names):
+            continue
+
+        try:
+            boxscore = get_json(BOXSCORE_URL.format(game_pk=game["gamePk"]))
+        except Exception as exc:
+            print(f"Skipped boxscore for gamePk {game.get('gamePk')}: {exc}")
+            continue
+
+        for case in extract_position_player_pitching_cases(game, boxscore):
+            if case_matches_any_team(case, team_contexts):
+                cases.append(case)
+
+    cases.sort(key=lambda item: (item["game_date_time"], item["pitcher_index"]), reverse=True)
+    return cases
+
+
+def get_current_season_position_player_pitching_cases_for_teams(
+    team_contexts: List[Dict[str, Any]],
+    state: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    season_start = current_mlb_season_start().isoformat()
+    cache_key = season_case_cache_key(team_contexts)
+    now = datetime.now(timezone.utc).timestamp()
+
+    if state is not None:
+        cache = safe_get(state, "season_case_cache", cache_key)
+        if isinstance(cache, dict):
+            generated_at = cache.get("generated_at")
+            cases = cache.get("cases")
+            if (
+                cache.get("season_start") == season_start
+                and isinstance(generated_at, (int, float))
+                and now - generated_at <= SEASON_CASE_CACHE_TTL_SECONDS
+                and isinstance(cases, list)
+            ):
+                return cases
+
+    cases = find_current_season_position_player_pitching_cases_for_teams(team_contexts)
+
+    if state is not None:
+        state.setdefault("season_case_cache", {})[cache_key] = {
+            "generated_at": now,
+            "season_start": season_start,
+            "cases": cases,
+        }
+
+    return cases
+
+
+def format_pitching_case_short(case: Dict[str, Any]) -> str:
+    return (
+        f"{case['player_name']}, {case['innings_pitched']} IP, "
+        f"{case['hits']} H, {case.get('walks', '?')} BB, {case['earned_runs']} ER"
+    )
+
+
+def format_team_season_cases_summary(
+    team_contexts: List[Dict[str, Any]],
+    cases: List[Dict[str, Any]],
+    max_cases_per_team: int = 4,
+) -> str:
+    lines = []
+    for team in team_contexts:
+        team_cases = [case for case in cases if case_matches_team(case, team)]
+        team_name = team.get("name") or "Unknown"
+        if not team_cases:
+            lines.append(f"{team_name} - 0")
+            continue
+
+        shown_cases = team_cases[:max_cases_per_team]
+        detail = "; ".join(format_pitching_case_short(case) for case in shown_cases)
+        remaining = len(team_cases) - len(shown_cases)
+        if remaining > 0:
+            detail = f"{detail}; +{remaining} ещё"
+        lines.append(f"{team_name} - {len(team_cases)} ({detail})")
+    return "\n".join(lines)
+
+
+def build_team_season_cases_summary(context: Dict[str, Any], state: Optional[Dict[str, Any]]) -> str:
+    team_contexts = game_team_contexts(context)
+    cases = get_current_season_position_player_pitching_cases_for_teams(team_contexts, state=state)
+    return format_team_season_cases_summary(team_contexts, cases)
+
+
+def get_player_season_pitching_stat(player_id: Any) -> Optional[Dict[str, Any]]:
+    if player_id is None:
+        return None
+
+    season_year = current_mlb_season_start().year
+    data = get_json(
+        PLAYER_STATS_URL.format(player_id=player_id),
+        params={"stats": "season", "group": "pitching", "season": season_year},
+    )
+
+    for stat_block in data.get("stats", []):
+        for split in stat_block.get("splits", []):
+            stat = split.get("stat", {})
+            games_pitched = as_int(stat.get("gamesPitched") or stat.get("gamesPlayed"))
+            if games_pitched and games_pitched > 0:
+                return stat
+    return None
+
+
+def format_player_season_pitching_history(player_id: Any) -> str:
+    try:
+        pitching_stat = get_player_season_pitching_stat(player_id)
+    except Exception as exc:
+        print(f"Could not load player pitching stats for {player_id}: {exc}")
+        return "Не удалось проверить прошлые выходы в этом сезоне."
+
+    if not pitching_stat:
+        return "До этого в этом сезоне питчером не выходил."
+
+    games_pitched = as_int(pitching_stat.get("gamesPitched") or pitching_stat.get("gamesPlayed")) or 0
+    innings_pitched = pitching_stat.get("inningsPitched") or "?"
+    hits = pitching_stat.get("hits", "?")
+    walks = pitching_stat.get("baseOnBalls", "?")
+    earned_runs = pitching_stat.get("earnedRuns", "?")
+    return (
+        f"Уже выходил в этом сезоне: {games_pitched} раз(а), "
+        f"{innings_pitched} IP, {hits} H, {walks} BB, {earned_runs} ER."
+    )
+
+
+def format_player_position(player_data: Dict[str, Any], fallback: Any) -> str:
+    abbreviation = safe_get(player_data, "primaryPosition", "abbreviation") or fallback or "non-P"
+    name = safe_get(player_data, "primaryPosition", "name")
+    if name and str(name).lower() != str(abbreviation).lower():
+        return f"{abbreviation} ({name})"
+    return str(abbreviation)
+
+
+def build_blowout_warning(feed: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     if not ENABLE_BLOWOUT_WARNING:
         return None
 
@@ -234,15 +450,18 @@ def build_blowout_warning(feed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not is_late_enough(current_inning):
         return None
 
-    leader_text = context["leading_team"] or "Unknown"
-    trailing_text = context["trailing_team"] or "Unknown"
+    try:
+        season_summary = build_team_season_cases_summary(context, state)
+    except Exception as exc:
+        print(f"Could not build season position-player pitching summary for gamePk {game_pk}: {exc}")
+        season_summary = "Не удалось загрузить сезонную статистику команд."
+
     message = (
         "⚠️ Разгромный счёт: возможен выход полевого игрока питчером\n\n"
-        f"Разница в счёте достигла {score_diff}.\n"
-        f"Лидирует: {leader_text}\n"
-        f"Проигрывает: {trailing_text}\n"
-        f"Матч: {context['away_team']} at {context['home_team']}\n"
-        f"Ситуация: {context['inning_half']} {current_inning}, {context['score_text']}\n"
+        f"Разница в счёте достигла {score_diff}.\n\n"
+        f"Ситуация: {context['inning_half']} {current_inning}, {context['score_text']}\n\n"
+        "Сезонные выходы полевых игроков на горку:\n"
+        f"{season_summary}\n\n"
         f"Защищается: {context['defensive_team']}\n"
         "Следующий алерт придёт, если питчера действительно заменит полевой игрок.\n"
         f"gamePk: {game_pk}"
@@ -256,7 +475,7 @@ def build_blowout_warning(feed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def build_position_player_alert(feed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def build_position_player_alert(feed: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     context = build_game_context(feed)
     game_data = context["game_data"]
     linescore = context["linescore"]
@@ -286,19 +505,25 @@ def build_position_player_alert(feed: Dict[str, Any]) -> Optional[Dict[str, Any]
 
     pitcher_name = pitcher.get("fullName") or safe_get(player_data, "fullName") or f"Player {pitcher_id}"
     game_pk = context["game_pk"]
+    position_text = format_player_position(player_data, primary_position)
+    history_text = format_player_season_pitching_history(pitcher_id)
 
     score_diff_text = "Unknown"
     if isinstance(score_diff, int):
         score_diff_text = str(score_diff)
 
     message = (
-        "🚨 Полевой игрок вышел питчером\n\n"
-        f"{pitcher_name} сейчас питчит за {context['defensive_team']}.\n"
-        f"Основная позиция: {primary_position}\n"
-        f"Матч: {context['away_team']} at {context['home_team']}\n"
-        f"Ситуация: {context['inning_half']} {current_inning}, {context['score_text']}\n"
-        f"Разница в счёте: {score_diff_text}\n"
-        f"Бьющая команда: {context['batting_team']}\n"
+        "!!! ALERT !!!\n\n"
+        "Полевой игрок вышел питчером\n\n"
+        f"Игрок: {pitcher_name}\n"
+        f"Команда: {context['defensive_team']}\n"
+        f"Основная позиция: {position_text}\n"
+        f"Питчит против: {context['batting_team']}\n\n"
+        f"Ситуация: {context['inning_half']} {current_inning}\n"
+        f"Счёт: {context['score_text']}\n"
+        f"Разница: {score_diff_text}\n\n"
+        "Опыт на горке:\n"
+        f"{history_text}\n\n"
         f"Статус: {context['detailed_state']}\n"
         f"gamePk: {game_pk}"
     )
@@ -311,19 +536,20 @@ def build_position_player_alert(feed: Dict[str, Any]) -> Optional[Dict[str, Any]
         "message": message,
         "key": key,
         "dedupe_keys": [key, f"{game_pk}:{pitcher_id}"],
+        "repeat_count": max(1, CONFIRMED_ALERT_REPEAT_COUNT),
+        "repeat_delay_seconds": max(0.0, CONFIRMED_ALERT_REPEAT_DELAY_SECONDS),
     }
 
 
-def build_alerts(feed: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_alerts(feed: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    position_player_alert = build_position_player_alert(feed, state=state)
+    if position_player_alert:
+        return [position_player_alert]
+
     alerts: List[Dict[str, Any]] = []
-    blowout_warning = build_blowout_warning(feed)
+    blowout_warning = build_blowout_warning(feed, state=state)
     if blowout_warning:
         alerts.append(blowout_warning)
-
-    position_player_alert = build_position_player_alert(feed)
-    if position_player_alert:
-        alerts.append(position_player_alert)
-
     return alerts
 
 
@@ -390,6 +616,7 @@ def extract_position_player_pitching_cases(game: Dict[str, Any], boxscore: Dict[
         players = team_boxscore.get("players", {})
         pitcher_ids = team_boxscore.get("pitchers", [])
         team_name = safe_get(team_boxscore, "team", "name") or schedule_team_name(game, side)
+        team_id = safe_get(team_boxscore, "team", "id") or safe_get(game, "teams", side, "team", "id")
         opponent_name = home_team if side == "away" else away_team
 
         for pitcher_index, pitcher_id in enumerate(pitcher_ids):
@@ -403,6 +630,7 @@ def extract_position_player_pitching_cases(game: Dict[str, Any], boxscore: Dict[
             pitches_text = f", {pitches_thrown} питчей" if pitches_thrown is not None else ""
             hits = pitching_stats.get("hits", "?")
             runs = pitching_stats.get("runs", "?")
+            walks = pitching_stats.get("baseOnBalls", "?")
             earned_runs = pitching_stats.get("earnedRuns", "?")
             outcome = describe_pitching_outcome(pitcher_ids, pitcher_index, players, pitching_stats)
             player_name = safe_get(player, "person", "fullName") or f"Player {pitcher_id}"
@@ -419,7 +647,9 @@ def extract_position_player_pitching_cases(game: Dict[str, Any], boxscore: Dict[
                     "game_date_time": game.get("gameDate") or official_date,
                     "game_pk": game.get("gamePk"),
                     "pitcher_index": pitcher_index,
+                    "player_id": pitcher_id,
                     "player_name": player_name,
+                    "team_id": team_id,
                     "team_name": team_name,
                     "opponent_name": opponent_name,
                     "positions": position_text,
@@ -428,6 +658,7 @@ def extract_position_player_pitching_cases(game: Dict[str, Any], boxscore: Dict[
                     "pitches_text": pitches_text,
                     "hits": hits,
                     "runs": runs,
+                    "walks": walks,
                     "earned_runs": earned_runs,
                     "outcome": outcome,
                 }
@@ -593,6 +824,20 @@ def send_telegram_message(text: str, chat_id: Optional[Any] = None) -> None:
     response.raise_for_status()
 
 
+def send_alert_messages(alert: Dict[str, Any]) -> int:
+    repeat_count = int(alert.get("repeat_count", 1) or 1)
+    repeat_delay_seconds = float(alert.get("repeat_delay_seconds", 0) or 0)
+    messages_sent = 0
+
+    for index in range(max(1, repeat_count)):
+        send_telegram_message(alert["message"])
+        messages_sent += 1
+        if index < repeat_count - 1 and repeat_delay_seconds > 0:
+            time.sleep(repeat_delay_seconds)
+
+    return messages_sent
+
+
 def run() -> int:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise BotError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID before running the bot.")
@@ -610,19 +855,22 @@ def run() -> int:
 
     for game_pk in live_game_pks:
         feed = get_json(LIVE_FEED_URL.format(game_pk=game_pk))
-        for alert in build_alerts(feed):
+        for alert in build_alerts(feed, state=state):
             key = alert["key"]
             dedupe_keys = alert.get("dedupe_keys", [key])
             if any(dedupe_key in alerts for dedupe_key in dedupe_keys):
                 continue
 
-            send_telegram_message(alert["message"])
+            messages_sent = send_alert_messages(alert)
             alerts[key] = datetime.now(timezone.utc).timestamp()
-            sent_count += 1
-            print(f"Sent {alert.get('alert_type', 'alert')} for {key}")
+            sent_count += messages_sent
+            print(
+                f"Sent {alert.get('alert_type', 'alert')} for {key} "
+                f"({messages_sent} message(s))"
+            )
 
     save_state(state)
-    print(f"Done. Alerts sent: {sent_count}")
+    print(f"Done. Telegram messages sent: {sent_count}")
     return sent_count
 
 
