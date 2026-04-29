@@ -39,6 +39,9 @@ jobs:
           SCORE_DIFF_THRESHOLD: '6'
           ENABLE_BLOWOUT_WARNING: 'true'
           INCLUDE_BLOWOUT_ONLY: 'true'
+          CONFIRMED_ALERT_REPEAT_COUNT: '3'
+          CONFIRMED_ALERT_REPEAT_DELAY_SECONDS: '3'
+          SEASON_CASE_CACHE_TTL_SECONDS: '21600'
           STATE_FILE: .cache/position_player_alert_state.json
         run: |
           mkdir -p .cache
