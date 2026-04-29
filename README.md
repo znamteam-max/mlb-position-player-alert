@@ -3,11 +3,12 @@
 This bot checks live MLB games and sends Telegram alerts in two steps:
 
 1. A blowout warning when the score differential reaches the configured threshold and a position-player pitching appearance becomes more likely.
-2. A follow-up alert when the current pitcher is **not** a primary-position pitcher.
+2. A confirmed `!!! ALERT !!!` message when the current pitcher is **not** a primary-position pitcher.
 
-It uses MLB's public live game feed and schedule endpoints to:
+It uses MLB's public live game feed, schedule, boxscore, and player stats endpoints to:
 - find live MLB games
 - detect blowout score situations
+- add current-season team context for position-player pitching appearances
 - identify the current defensive pitcher
 - compare that player's **primary position** against `P`
 - send Telegram messages in the warning-then-confirmation order
@@ -94,7 +95,9 @@ Supported commands:
 The workflow runs every 5 minutes and is currently configured to:
 - alert only from the 7th inning on
 - send a blowout warning once the score differential reaches 6 runs
-- require a blowout score before sending the position-player pitching confirmation
+- include a current-season summary for both teams in the blowout warning
+- require a blowout score before sending the confirmed position-player pitching alert
+- send the confirmed `!!! ALERT !!!` message 3 times, 3 seconds apart
 
 You can change these values in the workflow env block:
 
@@ -103,11 +106,57 @@ You can change these values in the workflow env block:
 - `SCORE_DIFF_THRESHOLD`
 - `ENABLE_BLOWOUT_WARNING`
 - `INCLUDE_BLOWOUT_ONLY`
+- `CONFIRMED_ALERT_REPEAT_COUNT`
+- `CONFIRMED_ALERT_REPEAT_DELAY_SECONDS`
 - `RECENT_CASE_LOOKBACK_DAYS`
 - `RECENT_CASE_MIN_SCORE_DIFF`
 - `COMMAND_CACHE_TTL_SECONDS`
+- `SEASON_CASE_CACHE_TTL_SECONDS`
 
-The state file stores separate dedupe keys for the blowout warning and the confirmed position-player pitching alert. If both conditions are first detected during the same run, the warning is sent first and the confirmation is sent immediately after it.
+The state file stores separate dedupe keys for the blowout warning and the confirmed position-player pitching alert. If a position-player pitching appearance is already detected, the confirmed alert takes priority over the warning.
+
+## Alert formats
+
+Blowout warning:
+
+```text
+⚠️ Разгромный счёт: возможен выход полевого игрока питчером
+
+Разница в счёте достигла 8.
+
+Ситуация: Bottom 8, Washington Nationals 0 – 8 New York Mets
+
+Сезонные выходы полевых игроков на горку:
+New York Mets - 1 (James McCann, 1.0 IP, 5 H, 2 BB, 3 ER)
+Washington Nationals - 0
+
+Защищается: Washington Nationals
+Следующий алерт придёт, если питчера действительно заменит полевой игрок.
+gamePk: 823636
+```
+
+Confirmed alert:
+
+```text
+!!! ALERT !!!
+
+Полевой игрок вышел питчером
+
+Игрок: Player Name
+Команда: Washington Nationals
+Основная позиция: 2B (Second Base)
+Питчит против: New York Mets
+
+Ситуация: Bottom 8
+Счёт: Washington Nationals 0 – 8 New York Mets
+Разница: 8
+
+Опыт на горке:
+До этого в этом сезоне питчером не выходил.
+
+Статус: In Progress
+gamePk: 823636
+```
 
 ## Local run
 
@@ -122,6 +171,7 @@ python bot.py
 
 - GitHub Actions cron is good for lightweight polling, but it is not truly instant.
 - The state file is cached between workflow runs to avoid duplicate alerts for the same game and pitcher.
+- The current-season team summary is cached in the state file for `SEASON_CASE_CACHE_TTL_SECONDS` seconds.
 - Vercel's filesystem is ephemeral, so `/api/cron` uses `/tmp` for temporary state and should not be relied on as the primary duplicate-alert store.
 - MLB live-feed field names can shift over time. If the bot stops detecting the current pitcher correctly, the first thing to check is the `liveData.linescore.defense.pitcher` path and the player metadata path in `gameData.players`.
 
