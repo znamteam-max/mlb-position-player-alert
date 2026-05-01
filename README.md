@@ -1,75 +1,59 @@
 # MLB position-player pitching alert bot
 
-This bot checks live MLB games and sends Telegram alerts in two steps:
+This bot checks MLB games and sends Telegram alerts in two steps:
 
-1. A blowout warning when the score differential reaches the configured threshold and a position-player pitching appearance becomes more likely.
-2. A confirmed `!!! ALERT !!!` message when the current pitcher is **not** a primary-position pitcher.
+1. A blowout warning when the score differential reaches the configured threshold.
+2. A confirmed `!!! ALERT !!!` message when a position player pitches.
 
-It uses MLB's public live game feed, schedule, boxscore, and player stats endpoints to:
-- find live MLB games
-- detect blowout score situations
-- add current-season team context for position-player pitching appearances
-- identify the current defensive pitcher
-- compare that player's **primary position** against `P`
-- send Telegram messages in the warning-then-confirmation order
+The scheduled runner now also performs a catch-up pass after the live check: if a blowout warning was sent but the game reached `Final` before the next poll, it rechecks the final boxscore and sends the confirmed alert from the boxscore.
 
 ## Files
 
-- `bot.py` — polling logic and Telegram alerts
-- `app.py` — small Flask entrypoint for Vercel deployments
+- `bot.py` — live polling logic, message formatting, Telegram sending, MLB helpers
+- `scheduled_run.py` — scheduled entrypoint; runs live polling plus final-game catch-up
+- `app.py` — Flask entrypoint for Vercel deployments
 - `command_extensions.py` — extra Telegram commands for historical blowout/watch checks
 - `requirements.txt` — Python dependency list
 - `.env.example` — local environment variables
 - `.github/workflows/position_player_alert.yml` — GitHub Actions scheduler
 
-## What you need
+## GitHub Setup
 
-1. A Telegram bot token
-2. Your Telegram chat ID
-3. GitHub repository secrets:
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-
-## GitHub setup
-
-Add these repository secrets in GitHub:
-
-- `Settings` → `Secrets and variables` → `Actions`
-- create `TELEGRAM_BOT_TOKEN`
-- create `TELEGRAM_CHAT_ID`
-
-Then enable GitHub Actions for the repository.
-
-## Vercel setup
-
-The repository includes `app.py` so Vercel can detect a Flask app entrypoint. After deployment:
-
-- `/` returns a healthcheck response
-- `/api/cron` runs the alert bot
-- `/api/telegram` handles Telegram commands
-
-Add these environment variables in Vercel:
+Add these repository secrets:
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
-- `CRON_SECRET` — a random string of at least 16 characters
-- `TELEGRAM_WEBHOOK_SECRET` — a separate random string for Telegram webhook validation
 
-The `/api/cron` endpoint requires this header:
+The workflow runs every 5 minutes and executes:
 
 ```bash
-Authorization: Bearer $CRON_SECRET
+python scheduled_run.py
 ```
 
-Manual test example:
+## Vercel Setup
+
+The repository includes `app.py` so Vercel can detect a Flask app entrypoint.
+
+Routes:
+
+- `/` — healthcheck
+- `/api/cron` — runs `scheduled_run.py` logic
+- `/api/telegram` — handles Telegram commands
+
+Add these Vercel environment variables:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `CRON_SECRET`
+- `TELEGRAM_WEBHOOK_SECRET`
+
+Manual cron test:
 
 ```bash
 curl -H "Authorization: Bearer $CRON_SECRET" https://your-project.vercel.app/api/cron
 ```
 
-Vercel Hobby plans only allow built-in cron jobs to run once per day. This bot is designed for frequent polling, so keep GitHub Actions enabled for the default 5-minute schedule unless you use Vercel Pro or an external scheduler that can call `/api/cron` with the authorization header.
-
-Telegram command setup:
+Telegram webhook setup:
 
 ```bash
 curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
@@ -77,115 +61,69 @@ curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
   -d "secret_token=$TELEGRAM_WEBHOOK_SECRET"
 ```
 
-Supported commands:
+## Settings
 
-- `/live` — currently live MLB games with teams, score, and inning. If there are no live games, the bot replies `Live матчей пока нет`.
-- `/recent` — last 5 detected position-player pitching appearances, including innings pitched, how the outing ended, hits, runs, and earned runs allowed.
-- `/blowouts` — last 5 completed blowout games where the score differential crossed the watch threshold and a position-player pitching appearance became more likely. Aliases: `/watch`, `/разгромы`, `/вероятность`.
-- `/help` — command list.
+Common environment variables:
 
-`/recent` and `/blowouts` scan recently completed MLB games and cache the answer briefly. Tune these values if needed:
+- `ALERT_ONLY_LATE_INNINGS=true`
+- `LATE_INNING_THRESHOLD=7`
+- `SCORE_DIFF_THRESHOLD=6`
+- `ENABLE_BLOWOUT_WARNING=true`
+- `INCLUDE_BLOWOUT_ONLY=true`
+- `CONFIRMED_ALERT_REPEAT_COUNT=3`
+- `CONFIRMED_ALERT_REPEAT_DELAY_SECONDS=3`
+- `FINAL_GAME_RECHECK_LOOKBACK_HOURS=48`
+- `RECENT_CASE_LOOKBACK_DAYS=90`
+- `RECENT_CASE_MIN_SCORE_DIFF=6`
+- `COMMAND_CACHE_TTL_SECONDS=1800`
+- `SEASON_CASE_CACHE_TTL_SECONDS=21600`
+- `STATE_FILE=.position_player_alert_state.json`
 
-- `RECENT_CASE_LOOKBACK_DAYS`
-- `RECENT_CASE_MIN_SCORE_DIFF`
-- `COMMAND_CACHE_TTL_SECONDS`
+`FINAL_GAME_RECHECK_LOOKBACK_HOURS` controls how far back the runner scans final games for missed confirmations. It only sends a catch-up confirmation when the state already contains `blowout_warning:{gamePk}`, so it should not alert on random old games.
 
-## Default behavior
+## Alert Behavior
 
-The workflow runs every 5 minutes and is currently configured to:
-- alert only from the 7th inning on
-- send a blowout warning once the score differential reaches 6 runs
-- include a current-season summary for both teams in the blowout warning
-- require a blowout score before sending the confirmed position-player pitching alert
-- send the confirmed `!!! ALERT !!!` message 3 times, 3 seconds apart
+Blowout warning includes:
 
-You can change these values in the workflow env block:
+- score differential
+- current situation and score
+- current-season position-player pitching history for both teams
+- defensive team
+- `gamePk`
 
-- `ALERT_ONLY_LATE_INNINGS`
-- `LATE_INNING_THRESHOLD`
-- `SCORE_DIFF_THRESHOLD`
-- `ENABLE_BLOWOUT_WARNING`
-- `INCLUDE_BLOWOUT_ONLY`
-- `CONFIRMED_ALERT_REPEAT_COUNT`
-- `CONFIRMED_ALERT_REPEAT_DELAY_SECONDS`
-- `RECENT_CASE_LOOKBACK_DAYS`
-- `RECENT_CASE_MIN_SCORE_DIFF`
-- `COMMAND_CACHE_TTL_SECONDS`
-- `SEASON_CASE_CACHE_TTL_SECONDS`
+Confirmed alert includes:
 
-The state file stores separate dedupe keys for the blowout warning and the confirmed position-player pitching alert. If a position-player pitching appearance is already detected, the confirmed alert takes priority over the warning.
+- `!!! ALERT !!!`
+- player name
+- team
+- primary position
+- opponent
+- score and score differential
+- pitching line
+- whether the player had pitched earlier this season
+- `gamePk`
 
-## Alert formats
+Confirmed alerts are sent 3 times, 3 seconds apart by default.
 
-Blowout warning:
+## Telegram Commands
 
-```text
-⚠️ Разгромный счёт: возможен выход полевого игрока питчером
+- `/live` — live MLB games with score and inning
+- `/recent` — last 5 detected position-player pitching appearances
+- `/blowouts` — last 5 completed blowout watch games
+- `/help` — command list
 
-Разница в счёте достигла 8.
-
-Ситуация: Bottom 8, Washington Nationals 0 – 8 New York Mets
-
-Сезонные выходы полевых игроков на горку:
-New York Mets - 1 (James McCann, 1.0 IP, 5 H, 2 BB, 3 ER)
-Washington Nationals - 0
-
-Защищается: Washington Nationals
-Следующий алерт придёт, если питчера действительно заменит полевой игрок.
-gamePk: 823636
-```
-
-Confirmed alert:
-
-```text
-!!! ALERT !!!
-
-Полевой игрок вышел питчером
-
-Игрок: Player Name
-Команда: Washington Nationals
-Основная позиция: 2B (Second Base)
-Питчит против: New York Mets
-
-Ситуация: Bottom 8
-Счёт: Washington Nationals 0 – 8 New York Mets
-Разница: 8
-
-Опыт на горке:
-До этого в этом сезоне питчером не выходил.
-
-Статус: In Progress
-gamePk: 823636
-```
-
-## Local run
+## Local Run
 
 ```bash
 pip install -r requirements.txt
 export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_CHAT_ID=...
-python bot.py
+python scheduled_run.py
 ```
 
 ## Notes
 
 - GitHub Actions cron is good for lightweight polling, but it is not truly instant.
-- The state file is cached between workflow runs to avoid duplicate alerts for the same game and pitcher.
-- The current-season team summary is cached in the state file for `SEASON_CASE_CACHE_TTL_SECONDS` seconds.
-- Vercel's filesystem is ephemeral, so `/api/cron` uses `/tmp` for temporary state and should not be relied on as the primary duplicate-alert store.
-- MLB live-feed field names can shift over time. If the bot stops detecting the current pitcher correctly, the first thing to check is the `liveData.linescore.defense.pitcher` path and the player metadata path in `gameData.players`.
-
-## Good Codex follow-up task
-
-```text
-Turn this starter into a production-ready MLB position-player pitching alert bot.
-
-Tasks:
-1. Add Slack and Discord notification options alongside Telegram.
-2. Improve detection by verifying the current pitcher from both linescore and play-by-play.
-3. Add richer alert text with score differential, outs, base state, and leverage context.
-4. Add tests with saved sample MLB live-feed payloads.
-5. Add logging and retry handling.
-6. Make the bot configurable for late innings only, blowouts only, or all position-player pitching appearances.
-7. Keep the existing simple GitHub Actions workflow, but also add a Railway or Render deployment option for near-real-time polling.
-```
+- The state file is cached between workflow runs to avoid duplicate alerts.
+- The final-game catch-up exists specifically for cases where the position-player appearance happens and the game finalizes between two 5-minute polls.
+- Vercel's filesystem is ephemeral, so GitHub Actions remains the better primary scheduler for dedupe state.
