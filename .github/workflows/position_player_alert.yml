@@ -41,11 +41,12 @@ jobs:
           INCLUDE_BLOWOUT_ONLY: 'true'
           CONFIRMED_ALERT_REPEAT_COUNT: '3'
           CONFIRMED_ALERT_REPEAT_DELAY_SECONDS: '3'
+          FINAL_GAME_RECHECK_LOOKBACK_HOURS: '48'
           SEASON_CASE_CACHE_TTL_SECONDS: '21600'
           STATE_FILE: .cache/position_player_alert_state.json
         run: |
           mkdir -p .cache
-          python bot.py
+          python scheduled_run.py
 
       - name: Save alert state cache
         if: always()
