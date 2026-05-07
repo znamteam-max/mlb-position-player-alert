@@ -8,6 +8,10 @@ on:
 jobs:
   alert:
     runs-on: ubuntu-latest
+    timeout-minutes: 7
+    concurrency:
+      group: position-player-alert
+      cancel-in-progress: false
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -41,6 +45,8 @@ jobs:
           INCLUDE_BLOWOUT_ONLY: 'true'
           CONFIRMED_ALERT_REPEAT_COUNT: '3'
           CONFIRMED_ALERT_REPEAT_DELAY_SECONDS: '3'
+          LIVE_POLL_WINDOW_SECONDS: '240'
+          LIVE_POLL_INTERVAL_SECONDS: '15'
           FINAL_GAME_RECHECK_LOOKBACK_HOURS: '48'
           SEASON_CASE_CACHE_TTL_SECONDS: '21600'
           STATE_FILE: .cache/position_player_alert_state.json
